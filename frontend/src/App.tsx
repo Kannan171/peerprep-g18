@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { onAuthStateChanged, signOut } from 'firebase/auth';
 import { auth } from './firebase';
 import { LandingPage } from './components/LandingPage';
@@ -7,9 +7,10 @@ import { Dashboard } from './components/Dashboard';
 import { MatchingPage } from './components/MatchingPage';
 import { CollaborationPage } from './components/CollaborationPage';
 import { ProfilePage } from './components/ProfilePage';
+import { AdminPage } from './components/AdminPage';
+import { GATEWAY_URL } from './constants';
 
-type Page = 'landing' | 'auth' | 'dashboard' | 'matching' | 'collaboration' | 'profile';
-const GATEWAY_URL = 'http://localhost:1234';
+type Page = 'landing' | 'auth' | 'dashboard' | 'matching' | 'collaboration' | 'profile' | 'admin';
 
 export default function App() {
   const [currentPage, setCurrentPage] = useState<Page>('landing');
@@ -17,32 +18,70 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [matchingCriteria, setMatchingCriteria] = useState<any>(null);
   const [session, setSession] = useState<any>(null);
+  const currentPageRef = useRef<Page>('landing');
 
-  // --- SESSION REHYDRATION ---
+  // Keep ref in sync so the onAuthStateChanged closure always reads the current page
+  useEffect(() => {
+    currentPageRef.current = currentPage;
+  }, [currentPage]);
+
+  // --- POST-LOGIN HANDLER (called directly by AuthPage after verified sign-in) ---
+  // App.tsx
+  const handleLoginSuccess = async (uid: string, token: string) => {
+    const maxRetries = 5;
+    let attempt = 0;
+
+    while (attempt < maxRetries) {
+      try {
+        localStorage.setItem('peerprep_token', token);
+        const res = await fetch(`${GATEWAY_URL}/users/${uid}`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+
+        if (res.ok) {
+          const profileData = await res.json();
+          const isAdmin = profileData.role?.toLowerCase() === 'admin' || profileData.username === 'Root';
+          setUser({
+            ...profileData,
+            uid,
+            avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${profileData.email}`
+          });
+          setCurrentPage(isAdmin ? 'admin' : 'dashboard');
+          return;
+        }
+
+        if (res.status === 401 && attempt < maxRetries - 1) {
+          console.warn(`Attempt ${attempt + 1} failed (401). Retrying in 3s for clock sync...`);
+          await new Promise(r => setTimeout(r, 3000));
+          attempt++;
+        } else {
+          throw new Error(`Profile fetch failed: ${res.status}`);
+        }
+      } catch (err) {
+        if (attempt < maxRetries - 1) {
+          attempt++;
+          continue;
+        }
+        console.error('Login failed:', err);
+        await signOut(auth);
+        setCurrentPage('landing');
+        return;
+      }
+    }
+  };
+
+  // --- SESSION REHYDRATION ON REFRESH (observer handles page reload only) ---
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      if (firebaseUser) {
+      // Only rehydrate if there is a user AND we don't already have their profile loaded
+      if (firebaseUser && currentPageRef.current !== 'auth' && !user) {
         try {
-          const token = await firebaseUser.getIdToken();
-          localStorage.setItem('peerprep_token', token);
-
-          const res = await fetch(`${GATEWAY_URL}/users/${firebaseUser.uid}`, {
-            headers: { 'Authorization': `Bearer ${token}` }
-          });
-          
-          if (res.ok) {
-            const profileData = await res.json();
-            setUser({
-              ...profileData,
-              uid: firebaseUser.uid,
-              avatar: `https://api.dicebear.com/7.x/avataaars/svg?seed=${profileData.Email}`
-            });
-            setCurrentPage('dashboard');
-          }
+          const token = await firebaseUser.getIdToken(true);
+          await handleLoginSuccess(firebaseUser.uid, token);
         } catch (err) {
-          console.error("Session restore failed:", err);
+          console.error("Session rehydration failed:", err);
         }
-      } else {
+      } else if (!firebaseUser) {
         setUser(null);
         localStorage.removeItem('peerprep_token');
       }
@@ -50,11 +89,6 @@ export default function App() {
     });
     return () => unsubscribe();
   }, []);
-
-  const handleLogin = (userData: any) => {
-    setUser(userData);
-    setCurrentPage('dashboard');
-  };
 
   const handleLogout = async () => {
     await signOut(auth);
@@ -86,20 +120,27 @@ export default function App() {
       {currentPage === 'landing' && (
         <LandingPage onGetStarted={() => setCurrentPage('auth')} />
       )}
-      
+
       {currentPage === 'auth' && (
-        <AuthPage onLogin={handleLogin} onBack={() => setCurrentPage('landing')} />
+        <AuthPage onBack={() => setCurrentPage('landing')} onLoginSuccess={handleLoginSuccess} />
       )}
-      
+
       {currentPage === 'dashboard' && (
-        <Dashboard 
+        <Dashboard
           user={user}
           onStartMatching={handleStartMatching}
           onProfileClick={() => setCurrentPage('profile')}
           onLogout={handleLogout}
         />
       )}
-      
+
+      {currentPage === 'admin' && (
+        <AdminPage
+          currentUser={user}
+          onLogout={handleLogout}
+        />
+      )}
+
       {currentPage === 'matching' && (
         <MatchingPage
           criteria={matchingCriteria}
@@ -108,7 +149,7 @@ export default function App() {
           onCancel={() => setCurrentPage('dashboard')}
         />
       )}
-      
+
       {currentPage === 'collaboration' && (
         <CollaborationPage
           user={user}
@@ -116,7 +157,7 @@ export default function App() {
           onEndSession={() => { setSession(null); setCurrentPage('dashboard'); }}
         />
       )}
-      
+
       {currentPage === 'profile' && (
         <ProfilePage
           user={user}
